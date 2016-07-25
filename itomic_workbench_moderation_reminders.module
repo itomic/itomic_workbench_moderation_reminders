@@ -1,0 +1,340 @@
+<?php
+
+/**
+ * Implements hook_cron()
+ */
+
+function itomic_workbench_moderation_reminders_cron(){
+    //itomic_workbench_moderation_reminders_run();
+}
+
+/**
+ * Implements hook_mail()
+ */
+function itomic_workbench_moderation_reminders_mail($key, &$message, $params){
+    switch($key){
+      case 'reminder':
+        $message['subject'] = $params['subject'];
+        $message['body'] = $params['body'];  
+        $plaintext = drupal_html_to_text($params['body']);
+        $plaintext = preg_replace('/(?:(?:\r\n|\r|\n)\s*){2}/s', "\n\n", $plaintext);
+        $message['params']['plaintext'] = $plaintext;
+      break;  
+    }
+}
+
+
+function itomic_workbench_moderation_reminders_run(){
+
+    $enabled = variable_get('itomic_workbench_moderation_reminders_enabled', 0);
+
+    if($enabled != 1){
+        return;
+    }
+
+    $emails = array();
+
+    $time_limit = variable_get('itomic_workbench_moderation_reminders_time_limit', 48);
+    $subject = variable_get('itomic_workbench_moderation_reminders_email_subject', '');
+    $content = variable_get('itomic_workbench_moderation_reminders_email_content', '');
+    $role = (int) variable_get('itomic_workbench_moderation_reminders_role', '');
+
+    $needs_review = itomic_workbench_moderation_reminders_needs_review($time_limit);
+    $users = itomic_workbench_moderation_reminders_get_users_with_role($role);
+
+    if(!empty($users)){
+      foreach($users as $user){
+        $emails[] = $user->mail; 
+      }
+    }
+
+    $emails[] = variable_get('itomic_workbench_moderation_reminders_email_email', '');
+    $emails = array_filter($emails);
+    $total = count($users);
+
+    if(empty($emails)){
+      drupal_set_message('[itomic_workbench_moderation_reminders] No emails addresses or users in set role.');
+      return;
+    }
+
+    $subject = str_replace('[total]', $total, $subject);
+    $content = str_replace('[total]', $total, $content);
+    $content = nl2br($content);
+    
+    foreach($emails as $email){
+
+      $params = array(
+        'subject' => $subject,
+        'body' => $content,
+      );
+
+      $message = drupal_mail(
+        'itomic_workbench_moderation_reminders', 
+        'reminder', 
+        $content, 
+        language_default(), 
+        $params, 
+        variable_get('site_mail', ini_get('sendmail_from'))
+      );
+      
+      if($message['result']){
+        drupal_set_message('[itomic_workbench_moderation_reminders] Sent to ' . $email);
+      }
+
+    }
+}
+
+
+/**
+ * Get needs review nodes
+ * @param  boolean $hours [description]
+ * @return [type]         [description]
+ */
+function itomic_workbench_moderation_reminders_needs_review($hours = false){
+
+    $query = db_select('node_revision', 'node_revision');
+    
+    $query->innerJoin(
+      'workbench_moderation_node_history', 
+      'workbench_moderation_node_history', 
+      'node_revision.vid = workbench_moderation_node_history.vid'
+    );
+
+    $query->innerJoin(
+      'node', 
+      'node_workbench_moderation_node_history', 
+      'workbench_moderation_node_history.nid = node_workbench_moderation_node_history.nid'
+    );
+
+    $query->leftJoin(
+      'users', 
+      'users_node_revision', 
+      "node_revision.uid = users_node_revision.uid"
+    );
+
+    $query->fields('node_revision', array('log', 'vid'));
+    $query->addField('node_revision', 'timestamp', 'revchanged');
+    $query->fields('workbench_moderation_node_history', array('state', 'nid', 'vid', 'is_current'));
+    $query->fields('node_workbench_moderation_node_history', array('nid', 'title', 'type', 'changed'));
+    $query->fields('users_node_revision', array('name', 'uid'));
+
+    $query->condition('workbench_moderation_node_history.is_current', '0', '<>');
+    $query->condition('workbench_moderation_node_history.state', 'needs_review', '=');
+
+    if($hours){
+      $time = time() - ($hours * 60 * 60);
+      $query->condition('node_revision.timestamp', $time, '<');
+    }
+
+    $query->orderby('node_revision.timestamp', 'DESC');
+
+    $result = $query->execute()->fetchAll();
+    
+    return $result;
+    
+}
+
+
+/**
+ * Implements hook_permission()
+ */
+function itomic_workbench_moderation_reminders_permission() {
+  return array(
+    'administer itomic_workbench_moderation_reminders settings' => array(
+      'title' => t('Administer boroondara newsletter settings'),
+      'description' => t('Administer itomic workbench moderation reminders settings.'),
+    ),
+    'access itomic_workbench_moderation_reminders reports' => array(
+      'title' => t('Access boroondara newsletter reports'),
+      'description' => t('Access itomic workbench moderation reminders settings.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu()
+ */
+function itomic_workbench_moderation_reminders_menu(){
+
+
+    $items['reminder-content'] = array(
+      'page callback' => 'itomic_workbench_moderation_reminders_run',
+      'access arguments' => array('access content'), 
+    );
+
+    $items['admin/config/workbench/reminders'] = array(
+        'title' => 'Workbench Reminders',
+        'description' => 'Workbench Reminders',
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('itomic_workbench_moderation_reminders_admin'),
+        'access arguments' => array('administer itomic_workbench_moderation_reminders settings'),
+        'type' => MENU_NORMAL_ITEM,
+    );
+
+    return $items;
+}
+
+
+/**
+ * Admin form
+ * @return Array
+ */
+function itomic_workbench_moderation_reminders_admin() {
+
+  $form = array();
+  $roles = user_roles(true);
+
+  $form['itomic_workbench_moderation_reminders_enabled'] = array(
+    '#type' => 'checkbox', 
+    '#title' => t('Enable'),
+    '#default_value' => variable_get('itomic_workbench_moderation_reminders_enabled', 0),
+  );
+
+  $form['itomic_workbench_moderation_reminders_time_limit'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Time limit (Hours)'),
+    '#default_value' => variable_get('itomic_workbench_moderation_reminders_time_limit', 48),
+    '#description' => t("How long in hours should the node be sitting in needs review before the alert is sent"),
+    '#required' => TRUE,
+  );
+
+  
+  $form['itomic_workbench_moderation_reminders_role'] = array(
+    '#type' => 'select',
+    '#options' => array_merge(array(0 => 'None'), $roles),
+    '#title' => t('Role'),
+    '#default_value' => variable_get('itomic_workbench_moderation_reminders_role', ''),
+    '#description' => t(""),
+    '#required' => TRUE,
+  );
+
+  $form['itomic_workbench_moderation_reminders_email_email'] = array(
+    '#type' => 'textfield',
+    '#title' => t('and/or Email'),
+    '#default_value' => variable_get('itomic_workbench_moderation_reminders_email_email', ''),
+    '#description' => t(""),
+    '#required' => FALSE,
+  );
+  
+  $form['itomic_workbench_moderation_reminders_email_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Email Subject'),
+    '#default_value' => variable_get('itomic_workbench_moderation_reminders_email_subject', ''),
+    '#description' => t(""),
+    '#required' => FALSE,
+  );
+
+  $form['itomic_workbench_moderation_reminders_email_content'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Email Content'),
+    '#default_value' => variable_get('itomic_workbench_moderation_reminders_email_content', ''),
+    '#description' => t("You can use the following tokens [total]"),
+    '#required' => FALSE,
+  );
+
+
+  return system_settings_form($form);
+}
+
+
+
+/**
+ * Get rid of the header tags for the text version
+ */
+function itomic_workbench_moderation_reminders_strip_head_tags( $text ){
+    $text = preg_replace(
+        array(
+          // Remove invisible content
+            '@<head[^>]*?>.*?</head>@siu',
+            '@<style[^>]*?>.*?</style>@siu',
+            '@<script[^>]*?.*?</script>@siu',
+        ),
+        array(
+            ' ', ' ', ' ',
+        ),
+        $text );
+    return $text;
+}
+
+/**
+ * @param  [type] $text [description]
+ * @return [type]       [description]
+ */
+function itomic_workbench_moderation_reminders_strip_html_tags( $text ){
+    $text = preg_replace(
+        array(
+          // Remove invisible content
+            '@<head[^>]*?>.*?</head>@siu',
+            '@<style[^>]*?>.*?</style>@siu',
+            '@<script[^>]*?.*?</script>@siu',
+            '@<object[^>]*?.*?</object>@siu',
+            '@<embed[^>]*?.*?</embed>@siu',
+            '@<applet[^>]*?.*?</applet>@siu',
+            '@<noframes[^>]*?.*?</noframes>@siu',
+            '@<noscript[^>]*?.*?</noscript>@siu',
+            '@<noembed[^>]*?.*?</noembed>@siu',
+          // Add line breaks before and after blocks
+            '@</?((address)|(blockquote)|(center)|(del))@iu',
+            '@</?((div)|(h[1-9])|(ins)|(isindex)|(p)|(pre))@iu',
+            '@</?((dir)|(dl)|(dt)|(dd)|(li)|(menu)|(ol)|(ul))@iu',
+            '@</?((table)|(th)|(td)|(caption))@iu',
+            '@</?((form)|(button)|(fieldset)|(legend)|(input))@iu',
+            '@</?((label)|(select)|(optgroup)|(option)|(textarea))@iu',
+            '@</?((frameset)|(frame)|(iframe))@iu',
+        ),
+        array(
+            ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+            "\n\$0", "\n\$0", "\n\$0", "\n\$0", "\n\$0", "\n\$0",
+            "\n\$0", "\n\$0",
+        ),
+        $text );
+    return strip_tags( $text );
+}
+
+
+
+
+/**
+ * Return all users who have the given role.
+ *
+ * @param int|string $role
+ *   Name of the role or the ID or the role.
+ * @param bool|TRUE $active_user
+ *   Determine, if only the active users should be returned.
+ * @return array
+ *   Array of user objects.
+ */
+function itomic_workbench_moderation_reminders_get_users_with_role($role, $active_user = TRUE) {
+  $users = array();
+  $rid = 0;
+  if (is_int($role)) {
+    $rid = $role;
+  }
+  else {
+    if ($role_obj = user_role_load_by_name($role)) {
+      $rid = $role_obj->rid;
+    }
+  }
+
+  if ($rid) {
+    $uids = db_select('users_roles', 'ur')
+      ->fields('ur', array('uid'))
+      ->condition('ur.rid', $rid)
+      ->execute()->fetchCol();
+
+    if (!empty($uids)) {
+      $query = new EntityFieldQuery();
+      $query->entityCondition('entity_type', 'user')
+        ->propertyCondition('uid', $uids, 'IN');
+      if ($active_user) {
+        $query->propertyCondition('status', 1);
+      }
+      $entities = $query->execute();
+      if (!empty($entities)) {
+        $users = user_load_multiple(array_keys($entities['user']));
+      }
+    }
+  }
+
+  return $users;
+}
